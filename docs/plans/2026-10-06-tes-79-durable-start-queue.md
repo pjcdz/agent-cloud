@@ -40,9 +40,11 @@ then becomes `finished`. Starts while a stop is in progress must wait for its
 observed completion. Repeated starts with a current request preserve its
 identity, generation and order. Replays retain the existing idempotency result.
 
-All queue writes use account advisory lock, installation advisory lock, then
-server row locks. Observation holds the existing server advisory lock but no
-database transaction spans a runtime effect. Admission is checked before
+Account operations take the account advisory lock and then the installation
+advisory lock before server row locks. Global queue maintenance takes only the
+installation lock and never requests an account lock while holding it.
+Observation holds the existing server advisory lock but no database
+transaction spans a runtime effect. Admission is checked before
 observation and current generation is checked again before applying an effect.
 This does not claim TES-83's broader concurrency acceptance.
 
