@@ -147,3 +147,25 @@ protocol readiness gate. `CLOUD_MAX_SERVERS=1` provides the single-installation
 capacity boundary used by the Compose quickstart. See
 [`infra/compose/README.md`](../../infra/compose/README.md) for the operator
 commands and credential boundary.
+
+## Managed beta account quota
+
+Set `CLOUD_ACCOUNT_QUOTA=beta` on `cloud-control` to enforce the approved D3
+policy: one logical server and one active server per authenticated principal.
+Create and start serialize the account quota check in the same PostgreSQL
+transaction as the intended state and request result. An excess returns
+`409 quota_exceeded` through REST, MCP or the CLI. Replaying an accepted request
+returns its stored result, and starting the same server again consumes no
+additional account slot.
+
+A stopped logical server still occupies its account's logical-server slot.
+An execution continues occupying the active slot until its stop is observed;
+requesting a stop alone does not free it. Pre-existing offline server records
+are retained when enabling the policy, and their starts compete for the one
+active slot. No records or worlds are deleted to satisfy a quota.
+
+The setting is optional and does not alter the Compose quickstart's
+`CLOUD_MAX_SERVERS=1` capacity result, `capacity_unavailable`. It does not add
+installation capacity, managed accounts, a FIFO queue or beta deployment.
+The PostgreSQL quota tests use two independent stores and verify competing
+creates and starts, stop completion, account separation and request replay.

@@ -35,7 +35,8 @@ export class ControlStore {
   public constructor(
     private readonly pool: pg.Pool,
     private readonly maxServers = 0,
-    private readonly storage: StorageReserve | null = null
+    private readonly storage: StorageReserve | null = null,
+    private readonly betaAccountQuota = false
   ) {}
 
   public static fromEnvironment(environment: NodeJS.ProcessEnv): ControlStore {
@@ -51,7 +52,8 @@ export class ControlStore {
       user: requireValue(environment, "DATABASE_USER"),
       password: requireValue(environment, "DATABASE_PASSWORD"),
       max: 10
-    }), capacityValue(environment.CLOUD_MAX_SERVERS), storageValue(environment));
+    }), capacityValue(environment.CLOUD_MAX_SERVERS), storageValue(environment),
+    accountQuotaValue(environment.CLOUD_ACCOUNT_QUOTA));
   }
 
   public async initialize(machineToken: string): Promise<Principal> {
@@ -156,8 +158,12 @@ export class ControlStore {
         await client.query("COMMIT");
         return claim.record.responseBody as AcceptedMutation;
       }
+      if (this.betaAccountQuota && mutation.operation !== "stop") {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [principalId]);
+      }
       let server: ServerRecord;
       if (mutation.operation === "create") {
+        if (this.betaAccountQuota) await this.assertAccountQuota(principalId, null, client);
         await assertFreeSpace(this.storage);
         if (this.maxServers > 0) {
           await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [principalId]);
@@ -182,6 +188,9 @@ export class ControlStore {
           [mutation.server_id, principalId]
         );
         if (current.rows[0] === undefined) throw new ControlError("server_not_found", 404);
+        if (this.betaAccountQuota && mutation.operation === "start") {
+          await this.assertAccountQuota(principalId, mutation.server_id, client);
+        }
         const desired = mutation.operation === "start" ? "running" : "stopped";
         const state = desired === "running" ? (current.rows[0].state === "running" ? "running" : "queued") :
           (current.rows[0].state === "stopped" ? "stopped" : "stopping");
@@ -223,6 +232,22 @@ export class ControlStore {
       throw error;
     } finally {
       client.release();
+    }
+  }
+
+  private async assertAccountQuota(principalId: string, serverId: string | null, client: pg.PoolClient): Promise<void> {
+    const counts = await client.query<{ logical: number; active: number }>(
+      `SELECT count(*)::int AS logical,
+              count(*) FILTER (WHERE id IS DISTINCT FROM $2::uuid AND
+                (desired_state = 'running' OR EXISTS (
+                  SELECT 1 FROM runs WHERE server_id = servers.id AND finished_at IS NULL
+                )))::int AS active
+         FROM servers WHERE principal_id = $1`,
+      [principalId, serverId]
+    );
+    const { logical, active } = counts.rows[0]!;
+    if ((serverId === null && logical >= 1) || active >= 1) {
+      throw new ControlError("quota_exceeded", 409);
     }
   }
 
@@ -310,6 +335,12 @@ function capacityValue(value: string | undefined): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) throw new Error("CLOUD_MAX_SERVERS must be a non-negative integer");
   return parsed;
+}
+
+function accountQuotaValue(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  if (value === "beta") return true;
+  throw new Error("CLOUD_ACCOUNT_QUOTA must be beta when set");
 }
 
 function storageValue(environment: NodeJS.ProcessEnv): StorageReserve | null {
