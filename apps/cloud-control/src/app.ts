@@ -3,8 +3,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { parseBearerToken, type Principal } from "./auth.js";
 import type { ControlStore } from "./database.js";
 import { ControlError, type ServerRecord } from "./lifecycle.js";
+import type { StartRequestStatus } from "./start-requests.js";
 
-type ControlApi = Pick<ControlStore, "authenticate" | "mutate" | "getServer">;
+type ControlApi = Pick<ControlStore, "authenticate" | "mutate" | "getServer"> &
+  Partial<Pick<ControlStore, "getStartRequest" | "cancelStartRequest">>;
 
 const MAX_JSON_BYTES = 16 * 1024;
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
@@ -93,6 +95,14 @@ function statusBody(server: ServerRecord) {
     ...(server.state === "running" && server.endpoint !== null ?
       { endpoint: server.endpoint } : {})
   };
+}
+
+function startRequestBody(request: StartRequestStatus) {
+  return { start_request_id: request.id, server_id: request.server_id, state: request.state,
+    arrived_at: request.arrived_at, arrival_order: request.arrival_order,
+    valid_requests_ahead: request.valid_requests_ahead, reserved_at: request.reserved_at,
+    expires_at: request.expires_at, admitted_at: request.admitted_at, terminal_at: request.terminal_at,
+    queue_url: `/v1/start-requests/${request.id}` };
 }
 
 function errorBody(error: ControlError) {
@@ -249,6 +259,22 @@ export function createRequestHandler(control: ControlApi) {
           operation: "create", name: input.name, eula_accepted: true
         });
         sendJson(response, 202, accepted);
+        return;
+      }
+
+      const queue = /^\/v1\/start-requests\/([^/]+)(\/cancel)?$/.exec(path);
+      if (queue !== null && ((request.method === "GET" && queue[2] === undefined) ||
+                            (request.method === "POST" && queue[2] === "/cancel"))) {
+        const principal = await requirePrincipal(request, response, control);
+        if (principal === null) return;
+        const requestId = queue[1]!;
+        if (!UUID.test(requestId)) throw new ControlError("invalid_start_request_id", 400);
+        if (request.method === "GET" && control.getStartRequest !== undefined) {
+          sendJson(response, 200, startRequestBody(await control.getStartRequest(principal.id, requestId)));
+        } else if (request.method === "POST" && control.cancelStartRequest !== undefined) {
+          const input = parseLifecycleRequest(await readJson(request));
+          sendJson(response, 202, await control.cancelStartRequest(principal.id, requestId, input.client_request_id));
+        } else throw new ControlError("start_request_not_found", 404);
         return;
       }
 

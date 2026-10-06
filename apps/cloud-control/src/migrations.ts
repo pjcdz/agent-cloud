@@ -114,6 +114,40 @@ ALTER TABLE servers
   ADD FOREIGN KEY (principal_id, last_request_id)
     REFERENCES idempotency_keys (principal_id, client_request_id);
 `
+  },
+  {
+    version: 5,
+    name: "durable_start_queue",
+    sql: `
+CREATE TABLE start_requests (
+  id uuid PRIMARY KEY,
+  principal_id uuid NOT NULL,
+  server_id uuid NOT NULL,
+  client_request_id text NOT NULL,
+  server_generation integer NOT NULL CHECK (server_generation > 0),
+  arrival_order bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+  arrived_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  state text NOT NULL CHECK (state IN ('queued', 'reserved', 'admitted', 'cancelled', 'expired', 'finished')),
+  reserved_at timestamptz,
+  expires_at timestamptz,
+  admitted_at timestamptz,
+  terminal_at timestamptz,
+  FOREIGN KEY (server_id, principal_id) REFERENCES servers(id, principal_id),
+  FOREIGN KEY (principal_id, client_request_id) REFERENCES idempotency_keys(principal_id, client_request_id),
+  CHECK ((reserved_at IS NULL) = (expires_at IS NULL)),
+  CHECK (expires_at > reserved_at),
+  CHECK (state <> 'queued' OR (reserved_at IS NULL AND admitted_at IS NULL)),
+  CHECK (state <> 'reserved' OR (reserved_at IS NOT NULL AND admitted_at IS NULL)),
+  CHECK ((state IN ('admitted', 'finished')) = (admitted_at IS NOT NULL)),
+  CHECK (state <> 'expired' OR reserved_at IS NOT NULL),
+  CHECK ((state IN ('cancelled', 'expired', 'finished')) = (terminal_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX start_requests_one_current_per_server ON start_requests(server_id)
+  WHERE state IN ('queued', 'reserved', 'admitted');
+CREATE UNIQUE INDEX start_requests_one_qualified_slot ON start_requests((true))
+  WHERE state IN ('reserved', 'admitted');
+`
   }
 ];
 

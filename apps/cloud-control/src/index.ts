@@ -26,9 +26,9 @@ const reconciler = runtime === null ? null : new Reconciler(store, runtime);
 let reconciling = false;
 let pending = Promise.resolve();
 const timer = setInterval(() => {
-  if (reconciling || reconciler === null) return;
+  if (reconciling) return;
   reconciling = true;
-  pending = reconciler.tick().catch(error => {
+  pending = store.advanceStartQueue().then(() => reconciler?.tick()).catch(error => {
     process.stderr.write(`${JSON.stringify({ event: "reconciliation_failed", error: String(error) })}\n`);
   }).finally(() => { reconciling = false; });
 }, 1000);

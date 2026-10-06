@@ -6,6 +6,8 @@ import pg from "pg";
 import { authenticateMachineToken, bootstrapOperator, type Principal } from "./auth.js";
 import { migrate } from "./migrations.js";
 import { ControlError, type AcceptedMutation, type Mutation, type RuntimeObservation, type ServerRecord, type ServerState } from "./lifecycle.js";
+import { advanceStartQueue, cancelStartRequest, currentStartRequest, lockStartQueue,
+  readStartRequest, recordStartRequest, type StartRequestRecord, type StartRequestStatus } from "./start-requests.js";
 
 const { Pool } = pg;
 
@@ -35,7 +37,8 @@ export class ControlStore {
   public constructor(
     private readonly pool: pg.Pool,
     private readonly maxServers = 0,
-    private readonly storage: StorageReserve | null = null
+    private readonly storage: StorageReserve | null = null,
+    private readonly startQueue = false
   ) {}
 
   public static fromEnvironment(environment: NodeJS.ProcessEnv): ControlStore {
@@ -51,7 +54,8 @@ export class ControlStore {
       user: requireValue(environment, "DATABASE_USER"),
       password: requireValue(environment, "DATABASE_PASSWORD"),
       max: 10
-    }), capacityValue(environment.CLOUD_MAX_SERVERS), storageValue(environment));
+    }), capacityValue(environment.CLOUD_MAX_SERVERS), storageValue(environment),
+    startQueueValue(environment.CLOUD_START_QUEUE));
   }
 
   public async initialize(machineToken: string): Promise<Principal> {
@@ -156,7 +160,12 @@ export class ControlStore {
         await client.query("COMMIT");
         return claim.record.responseBody as AcceptedMutation;
       }
+      if (this.startQueue) {
+        await lockStartQueue(client, principalId);
+        await advanceStartQueue(client);
+      }
       let server: ServerRecord;
+      let startRequest: StartRequestRecord | null = null;
       if (mutation.operation === "create") {
         await assertFreeSpace(this.storage);
         if (this.maxServers > 0) {
@@ -182,18 +191,38 @@ export class ControlStore {
           [mutation.server_id, principalId]
         );
         if (current.rows[0] === undefined) throw new ControlError("server_not_found", 404);
-        const desired = mutation.operation === "start" ? "running" : "stopped";
-        const state = desired === "running" ? (current.rows[0].state === "running" ? "running" : "queued") :
-          (current.rows[0].state === "stopped" ? "stopped" : "stopping");
-        const result = await client.query<ServerRecord>(
-          `UPDATE servers SET desired_state = $3, state = $4, generation = generation + 1,
-             last_request_id = $5, updated_at = now()
-           WHERE id = $1 AND principal_id = $2 RETURNING *`,
-          [mutation.server_id, principalId, desired, state, requestId]
-        );
-        server = result.rows[0]!;
+        server = current.rows[0];
+        startRequest = this.startQueue ? await currentStartRequest(client, server.id) : null;
+        if (this.startQueue && mutation.operation === "start" && server.state === "stopping") {
+          throw new ControlError("server_stopping", 409);
+        }
+        if (mutation.operation === "stop" && startRequest !== null &&
+            (startRequest.state === "queued" || startRequest.state === "reserved")) {
+          await cancelStartRequest(client, startRequest);
+          server = (await client.query<ServerRecord>("SELECT * FROM servers WHERE id = $1", [server.id])).rows[0]!;
+        } else if (!(mutation.operation === "start" && startRequest !== null &&
+                     startRequest.server_generation === server.generation)) {
+          const desired = mutation.operation === "start" ? "running" : "stopped";
+          const state = desired === "running" ? (server.state === "running" ? "running" : "queued") :
+            (server.state === "stopped" ? "stopped" : "stopping");
+          const result = await client.query<ServerRecord>(
+            `UPDATE servers SET desired_state = $3, state = $4, generation = generation + 1,
+               last_request_id = $5, updated_at = now()
+             WHERE id = $1 AND principal_id = $2 RETURNING *`,
+            [mutation.server_id, principalId, desired, state, requestId]
+          );
+          server = result.rows[0]!;
+        }
       }
-      if (server.desired_state === "running") {
+      if (this.startQueue && mutation.operation !== "stop" && startRequest === null) {
+        startRequest = await recordStartRequest(client, server, requestId);
+        if (startRequest.state === "admitted" && server.state !== "running") {
+          server = (await client.query<ServerRecord>(
+            "UPDATE servers SET state = 'provisioning' WHERE id = $1 RETURNING *", [server.id]
+          )).rows[0]!;
+        }
+      }
+      if (server.desired_state === "running" && (!this.startQueue || startRequest?.state === "admitted")) {
         await client.query(
           `INSERT INTO runs (id, server_id, state) VALUES ($1, $2, 'queued')
            ON CONFLICT (server_id) WHERE state IN ('queued', 'provisioning', 'running', 'stopping') DO NOTHING`,
@@ -201,7 +230,10 @@ export class ControlStore {
         );
       }
       const response: AcceptedMutation = { request_id: requestId, server_id: server.id, state: server.state,
-        status_url: `/v1/servers/${server.id}` };
+        status_url: `/v1/servers/${server.id}`,
+        ...(mutation.operation !== "stop" && startRequest !== null ?
+          { start_request_id: startRequest.id, queue_url: `/v1/start-requests/${startRequest.id}` } : {}) };
+      if (this.startQueue && mutation.operation === "stop") await advanceStartQueue(client);
       await client.query(
         `INSERT INTO events (principal_id, server_id, event_type, payload)
          VALUES ($1, $2, 'intent_recorded', $3)`,
@@ -232,6 +264,83 @@ export class ControlStore {
     );
     if (result.rows[0] === undefined) throw new ControlError("server_not_found", 404);
     return result.rows[0];
+  }
+
+  public async getStartRequest(principalId: string, requestId: string): Promise<StartRequestStatus> {
+    if (!this.startQueue) throw new ControlError("start_request_not_found", 404);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockStartQueue(client, principalId);
+      await advanceStartQueue(client);
+      const request = await readStartRequest(client, principalId, requestId);
+      await client.query("COMMIT");
+      return request;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  public async cancelStartRequest(principalId: string, requestId: string, clientRequestId: string): Promise<{
+    start_request_id: string; server_id: string; state: "cancelled"; queue_url: string;
+  }> {
+    if (!this.startQueue) throw new ControlError("start_request_not_found", 404);
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(clientRequestId)) throw new ControlError("invalid_request_id", 400);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const claim = await this.claimIdempotencyKey(principalId, clientRequestId, "cancel_start_request",
+        JSON.stringify({ start_request_id: requestId }), client);
+      if (claim.record.responseStatus !== null) {
+        await client.query("COMMIT");
+        return claim.record.responseBody as Awaited<ReturnType<ControlStore["cancelStartRequest"]>>;
+      }
+      await lockStartQueue(client, principalId);
+      await advanceStartQueue(client);
+      const request = await readStartRequest(client, principalId, requestId);
+      await cancelStartRequest(client, request);
+      await advanceStartQueue(client);
+      const response = { start_request_id: request.id, server_id: request.server_id,
+        state: "cancelled" as const, queue_url: `/v1/start-requests/${request.id}` };
+      await this.completeIdempotencyKey(principalId, clientRequestId, 202, response, client);
+      await client.query("COMMIT");
+      return response;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  public async advanceStartQueue(): Promise<void> {
+    if (!this.startQueue) return;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended('cloud:start-queue', 0))");
+      await advanceStartQueue(client);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
+  }
+
+  public async shouldReconcile(server: ServerRecord, client: pg.PoolClient): Promise<boolean> {
+    if (!this.startQueue) return true;
+    const current = await this.getDesiredServer(server.id, client);
+    if (current === null || current.generation !== server.generation) return false;
+    const run = await client.query("SELECT 1 FROM runs WHERE server_id = $1 AND finished_at IS NULL", [server.id]);
+    if (server.desired_state === "stopped") return run.rowCount === 1;
+    const request = await currentStartRequest(client, server.id);
+    return request === null ? run.rowCount === 1 :
+      request.state === "admitted" && request.server_generation === server.generation;
+  }
+
+  public async isStartAdmitted(server: ServerRecord, client: pg.PoolClient): Promise<boolean> {
+    if (!this.startQueue) return true;
+    const request = await currentStartRequest(client, server.id);
+    return request?.state === "admitted" && request.server_generation === server.generation;
   }
 
   public async listServerIds(): Promise<string[]> {
@@ -270,6 +379,7 @@ export class ControlStore {
       (observed.state === "absent" || observed.state === "stopped" ? "stopped" : "stopping");
     await client.query("BEGIN");
     try {
+      if (this.startQueue) await lockStartQueue(client, server.principal_id);
       const updated = await client.query(
         `UPDATE servers SET state = $3, observed_generation = $2,
            endpoint = COALESCE($4::jsonb, endpoint), updated_at = now()
@@ -290,6 +400,13 @@ export class ControlStore {
           [server.principal_id, server.id, run.rows[0]?.id ?? null,
             { request_id: server.last_request_id, generation: server.generation, state }]
         );
+        if (this.startQueue && state === "stopped") {
+          await client.query(
+            `UPDATE start_requests SET state = 'finished', terminal_at = clock_timestamp()
+             WHERE server_id = $1 AND state = 'admitted'`, [server.id]
+          );
+          await advanceStartQueue(client);
+        }
       }
       await client.query("COMMIT");
     } catch (error) {
@@ -310,6 +427,12 @@ function capacityValue(value: string | undefined): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) throw new Error("CLOUD_MAX_SERVERS must be a non-negative integer");
   return parsed;
+}
+
+function startQueueValue(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  if (value === "beta") return true;
+  throw new Error("CLOUD_START_QUEUE must be beta when set");
 }
 
 function storageValue(environment: NodeJS.ProcessEnv): StorageReserve | null {

@@ -147,3 +147,49 @@ protocol readiness gate. `CLOUD_MAX_SERVERS=1` provides the single-installation
 capacity boundary used by the Compose quickstart. See
 [`infra/compose/README.md`](../../infra/compose/README.md) for the operator
 commands and credential boundary.
+
+## Managed beta start queue
+
+`CLOUD_START_QUEUE=beta` enables durable start requests. Without it, the
+foundation lifecycle and Compose defaults retain their existing behavior.
+The backend admits only the fixed `paper-26.2-121` / `two-player` profile into
+one qualified slot per installation. This is an admission boundary, not a
+measurement of available CPU or RAM on another host.
+
+Create and start responses add `start_request_id` and `queue_url`. A free slot
+admits the request immediately. Otherwise it waits in FIFO order, assigned in
+PostgreSQL independently of timestamp ties. An earlier queued request has
+priority over new arrivals. Repeated starts retain the current request and
+generation; idempotent retries return the recorded response.
+
+When capacity becomes free, the oldest waiting request receives a five-minute
+reservation. Waiting requests have no expiry until that reservation begins.
+Reserved requests remain unexecuted pending the separate confirmation work.
+Only an admitted request creates a run. Cancellation and expiry preserve
+history; a later attempt joins the tail. An admitted run keeps the slot until
+its stop is observed, then its request becomes `finished`. Requesting a stop
+alone does not release it. A start while that stop is still in progress returns
+`409 server_stopping` and can be retried after observed completion.
+
+Use the authenticated `GET /v1/start-requests/<start_request_id>` to read state,
+arrival, durable order, `valid_requests_ahead`, reservation and expiry. Ahead
+counts include earlier queued requests and live reservations. Cancel a queued
+or reserved request with `POST /v1/start-requests/<start_request_id>/cancel`
+and a JSON `client_request_id`. Cancellation is idempotent and changes only
+that pending server intent. Cancelling an admitted or expired request returns
+`409 start_request_not_pending`; stopping a game uses the normal stop route.
+Foreign and missing requests return `404 start_request_not_found`.
+
+Reads, mutations and the existing control tick advance expired reservations
+in the database. Pending requests never observe or operate the runtime, so
+their cancellation cannot stop another admitted game. Existing unfinished
+foundation runs still occupy capacity and can be observed and stopped when
+opting in; an explicit repeated start can adopt the existing run without
+creating another one.
+
+The [TES-79 evidence](../../infra/evidence/tes-79-durable-start-queue.md)
+qualifies this backend with synthetic PostgreSQL records and controlled runtime
+effects. The fixed Compose game and volume do not establish multiple managed
+worlds. Account quota, confirmation, notices, UI, polling budget and broader
+queue concurrency acceptance retain their separate issue scope. No ETA is
+returned.

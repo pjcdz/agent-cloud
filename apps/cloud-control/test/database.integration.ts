@@ -94,7 +94,7 @@ test("PostgreSQL preserves machine identity, ownership and operation records", a
         /idempotency_key_reused/
       );
       const migrations = await pool.query("SELECT version FROM schema_migrations ORDER BY version");
-      assert.deepEqual(migrations.rows, [{ version: 1 }, { version: 2 }, { version: 3 }]);
+      assert.deepEqual(migrations.rows, [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 5 }]);
       assert.equal((await pool.query("SELECT id FROM runs WHERE id = $1", [runId])).rowCount, 1);
       assert.equal((await pool.query("SELECT id FROM events WHERE run_id = $1", [runId])).rowCount, 1);
     });

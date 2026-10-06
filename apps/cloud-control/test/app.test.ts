@@ -5,8 +5,10 @@ import test from "node:test";
 
 import { createRequestHandler, handleRequest } from "../src/app.js";
 import { ControlError, type Mutation, type ServerRecord } from "../src/lifecycle.js";
+import type { StartRequestStatus } from "../src/start-requests.js";
 
 const SERVER_ID = "44752f9d-5564-4e43-9346-cd30a99a1613";
+const START_REQUEST_ID = "84752f9d-5564-4e43-9346-cd30a99a1613";
 
 async function withServer(run: (origin: string) => Promise<void>): Promise<void> {
   const server = createServer(handleRequest);
@@ -78,6 +80,53 @@ test("machine identity requires a valid bearer token", async () => {
     });
     assert.equal(valid.status, 200);
     assert.deepEqual(await valid.json(), { id: "principal-1", subject: "operator" });
+  });
+});
+
+test("queue backend authenticates reads and cancellation and returns durable state without an ETA", async () => {
+  const fake = createControl();
+  const request: StartRequestStatus = {
+    id: START_REQUEST_ID, principal_id: "principal-1", server_id: SERVER_ID, client_request_id: "start-one",
+    server_generation: 1, arrival_order: "123", arrived_at: new Date("2026-10-06T12:00:00Z"),
+    state: "queued", valid_requests_ahead: 2, reserved_at: null, expires_at: null,
+    admitted_at: null, terminal_at: null
+  };
+  const control = { ...fake.control,
+    getStartRequest: async (principalId: string, requestId: string) => {
+      assert.equal(principalId, request.principal_id);
+      if (requestId !== request.id) throw new ControlError("start_request_not_found", 404);
+      return request;
+    },
+    cancelStartRequest: async (principalId: string, requestId: string, clientRequestId: string) => {
+      assert.equal(principalId, request.principal_id);
+      assert.equal(clientRequestId, "cancel-one");
+      if (requestId !== request.id) throw new ControlError("start_request_not_found", 404);
+      return { start_request_id: requestId, server_id: SERVER_ID, state: "cancelled" as const,
+        queue_url: `/v1/start-requests/${requestId}` };
+    }
+  };
+  await withAuthenticatedServer(control, async origin => {
+    const url = `${origin}/v1/start-requests/${START_REQUEST_ID}`;
+    const headers = { authorization: "Bearer operator-machine-token", "content-type": "application/json" };
+    assert.equal((await fetch(url)).status, 401);
+    assert.equal((await fetch(`${url}/cancel`, { method: "POST" })).status, 401);
+    const response = await fetch(url, { headers });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body, {
+      start_request_id: START_REQUEST_ID, server_id: SERVER_ID, state: "queued",
+      arrived_at: "2026-10-06T12:00:00.000Z", arrival_order: "123", valid_requests_ahead: 2,
+      reserved_at: null, expires_at: null, admitted_at: null, terminal_at: null,
+      queue_url: `/v1/start-requests/${START_REQUEST_ID}`
+    });
+    assert.deepEqual(await (await fetch(url, { headers })).json(), body);
+    assert.equal((await fetch(`${origin}/v1/start-requests/${SERVER_ID}`, { headers })).status, 404);
+    assert.equal((await fetch(`${origin}/v1/start-requests/invalid`, { headers })).status, 400);
+    const cancelled = await fetch(`${url}/cancel`, { method: "POST", headers,
+      body: JSON.stringify({ client_request_id: "cancel-one" }) });
+    assert.equal(cancelled.status, 202);
+    assert.deepEqual(await cancelled.json(), { start_request_id: START_REQUEST_ID, server_id: SERVER_ID,
+      state: "cancelled", queue_url: `/v1/start-requests/${START_REQUEST_ID}` });
   });
 });
 

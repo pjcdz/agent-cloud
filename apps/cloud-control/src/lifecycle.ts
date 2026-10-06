@@ -23,6 +23,8 @@ export interface AcceptedMutation {
   server_id: string;
   state: ServerState;
   status_url: string;
+  start_request_id?: string;
+  queue_url?: string;
 }
 export interface RuntimeObservation {
   state: "absent" | "stopped" | "starting" | "ready" | "stopping";
@@ -48,12 +50,14 @@ export class Reconciler {
     await this.store.withServerLock(serverId, async (client) => {
       const server = await this.store.getDesiredServer(serverId, client);
       if (server === null) return;
+      if (!await this.store.shouldReconcile(server, client)) return;
       const observed = await this.runtime.observe(server);
       await this.store.recordObservation(server, observed, client);
-      if (server.desired_state === "running") {
+      if (!await this.store.shouldReconcile(server, client)) return;
+      if (server.desired_state === "running" && await this.store.isStartAdmitted(server, client)) {
         if (observed.state === "absent") await this.runtime.create(server);
         else if (observed.state === "stopped") await this.runtime.start(server);
-      } else if (observed.state === "ready" || observed.state === "starting") {
+      } else if (server.desired_state === "stopped" && (observed.state === "ready" || observed.state === "starting")) {
         await this.runtime.stop(server);
       }
     });
