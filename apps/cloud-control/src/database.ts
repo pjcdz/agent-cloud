@@ -4,6 +4,7 @@ import { statfs } from "node:fs/promises";
 import pg from "pg";
 
 import { authenticateMachineToken, bootstrapOperator, type Principal } from "./auth.js";
+import { BackupStore } from "./backup.js";
 import { migrate } from "./migrations.js";
 import { ControlError, type AcceptedMutation, type Mutation, type RuntimeObservation, type ServerRecord, type ServerState } from "./lifecycle.js";
 
@@ -32,11 +33,15 @@ export async function assertFreeSpace(
 }
 
 export class ControlStore {
+  public readonly backups: BackupStore;
+
   public constructor(
     private readonly pool: pg.Pool,
     private readonly maxServers = 0,
     private readonly storage: StorageReserve | null = null
-  ) {}
+  ) {
+    this.backups = new BackupStore(pool);
+  }
 
   public static fromEnvironment(environment: NodeJS.ProcessEnv): ControlStore {
     const host = requireValue(environment, "DATABASE_HOST");
